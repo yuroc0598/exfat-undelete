@@ -29,5 +29,22 @@ class RecoverTest(unittest.TestCase):
             self.assertIn("1/2 clusters reused", res.stdout)
 
 
+    def test_carve_orphan_video(self):
+        sys.path.insert(0, HERE)
+        import make_test_image as m
+        with tempfile.TemporaryDirectory() as tmp:
+            img, out = os.path.join(tmp, "card.img"), os.path.join(tmp, "out")
+            m.main(img)
+            res = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "exfat_undelete.py"),
+                                  img, "--carve", "--out", out],
+                                 check=True, capture_output=True, text=True)
+            self.assertIn("20250101_000000_c60.mp4", res.stdout)
+            self.assertIn("12s", res.stdout)
+            with open(os.path.join(out, "20250101_000000_c60.mp4"), "rb") as f:
+                self.assertEqual(f.read(), m.orphan_video())
+            # live file and already-listed deleted files must not be carved a second time
+            self.assertEqual(res.stdout.count("(carved)"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

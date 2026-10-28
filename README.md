@@ -23,6 +23,7 @@ Always recover to a different disk than the card. Stop using the card as soon as
 | --- | --- |
 | `--out DIR` | recover into DIR (omit to only list) |
 | `--deep` | scan the whole card for deleted entries (slow; finds files from deleted folders) |
+| `--carve` | also find MP4/MOV videos in free space by signature, with no directory entry needed (use after a reformat, or for files deleted long ago). Reads each file's creation date and duration, so you can spot the old ones |
 | `--match TEXT` | only names containing TEXT |
 | `--min-size MB` | minimum size |
 | `--any` / `--ext mp4,mov` | all file types / custom extensions |
@@ -32,7 +33,8 @@ Status column: `intact` means none of the file's clusters were reused; `N/M clus
 
 ## Limits
 
-- Reformatted cards: directory entries are gone; use a carver.
+- Reformatted cards, or files deleted long ago whose directory entries were reused: use `--carve`. It needs the file's first cluster and its `moov` section to be intact, and assumes the file was written contiguously. Only MP4/MOV (including `.m4v`/`.3gp`-style ISO files) are carved; other formats are only found through directory entries.
+- Anything the card has overwritten since is gone for good, whatever the tool.
 - Deleted files are assumed to be stored contiguously (cameras almost always do this). A fragmented file whose FAT chain was cleared on delete may come out corrupted.
 - Partition tables: whole-volume, MBR and GPT with 512-byte sectors.
 - Developed and tested on macOS only against synthetic images (`tests/`). Not yet validated across many real cards. Reports welcome.

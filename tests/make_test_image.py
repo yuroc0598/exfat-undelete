@@ -13,6 +13,20 @@ def data(seed, size):
     return bytes((i * 7 + seed) % 251 for i in range(size))
 
 
+ORPHAN_MDAT = 6000
+ORPHAN_CREATED = 3818534400  # 2025-01-01 00:00:00 UTC in seconds since 1904
+ORPHAN_SECONDS = 12
+
+
+def orphan_video():
+    ftyp = struct.pack(">I4s4sI4s4s", 24, b"ftyp", b"isom", 0, b"isom", b"mp41")
+    mdat = struct.pack(">I4s", ORPHAN_MDAT, b"mdat") + data(9, ORPHAN_MDAT - 8)
+    mvhd = struct.pack(">I4sB3xIIII", 108, b"mvhd", 0, ORPHAN_CREATED, ORPHAN_CREATED,
+                       1000, ORPHAN_SECONDS * 1000).ljust(108, b"\0")
+    moov = struct.pack(">I4s", 116, b"moov") + mvhd
+    return ftyp + mdat + moov
+
+
 def checksum(buf):
     cs = 0
     for i, b in enumerate(buf):
@@ -67,6 +81,8 @@ def main(out):
     }
     for name, (first, size, seed) in files.items():
         put(first, data(seed, size))
+
+    put(60, orphan_video())  # no directory entry anywhere: only carving can find it
 
     # FAT: bitmap, root, DCIM chains end-of-file; live.mp4 uses NoFatChain.
     def fat(c, v):

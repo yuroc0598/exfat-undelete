@@ -9,6 +9,7 @@ been reused since.
     sudo python3 exfat_undelete.py /dev/disk4                  # list
     sudo python3 exfat_undelete.py /dev/disk4 --out ~/recovered
     sudo python3 exfat_undelete.py /dev/disk4 --deep --out ~/recovered
+    sudo python3 exfat_undelete.py /dev/disk4 --deep --carve   # also find old videos
 """
 import argparse
 import datetime
@@ -247,6 +248,94 @@ def deep_scan(vol, out):
     sys.stderr.write("\n")
 
 
+CARVE_ATOMS = {b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"junk", b"uuid",
+               b"pnot", b"meta", b"udta", b"moof", b"mfra", b"sidx", b"styp", b"pdin"}
+
+
+def read_atom(vol, off):
+    h = vol.dev.read(off, 16)
+    size, typ = struct.unpack(">I4s", h[:8])
+    if size == 1:
+        size = struct.unpack(">Q", h[8:16])[0]
+    return size, typ
+
+
+def parse_mvhd(vol, moov_off):
+    """(creation datetime, duration seconds) from the first child of moov, if it is mvhd."""
+    d = vol.dev.read(moov_off + 8, 40)
+    if d[4:8] != b"mvhd":
+        return None, None
+    if d[8] == 1:
+        ct, ts, dur = struct.unpack_from(">QxxxxxxxxIQ", d, 12)
+    else:
+        ct, ts, dur = struct.unpack_from(">IxxxxII", d, 12)
+    try:
+        when = datetime.datetime(1904, 1, 1) + datetime.timedelta(seconds=ct)
+    except OverflowError:
+        when = None
+    if when and not 1990 <= when.year <= 2100:
+        when = None
+    return when, (dur / ts if ts else None)
+
+
+def carve_at(vol, c, heap_end):
+    """Walk MP4/MOV top-level atoms from cluster c; return the file's extent if it is complete."""
+    start = pos = vol.coff(c)
+    seen, moov_at = [], None
+    while pos + 8 <= heap_end:
+        size, typ = read_atom(vol, pos)
+        if typ not in CARVE_ATOMS or size < 8 or pos + size > heap_end:
+            break
+        if typ == b"ftyp" and b"ftyp" in seen:
+            break  # next file starts here
+        seen.append(typ)
+        if typ == b"moov":
+            moov_at = pos
+        pos += size
+        if moov_at is not None and b"mdat" in seen and b"moof" not in seen:
+            break
+    if not seen or seen[0] != b"ftyp" or moov_at is None or b"mdat" not in seen:
+        return None
+    return pos - start, moov_at
+
+
+def carve(vol, skip_firsts, out):
+    """Find MP4/MOV files in free space by signature, with no directory entry needed."""
+    cs, last = vol.csize, vol.ccount + 2
+    heap_end = vol.coff(last)
+    step = max(1, (8 << 20) // cs)
+    next_ok, c, partial = 2, 2, 0
+    while c < last:
+        n = min(step, last - c)
+        data = vol.dev.read(vol.coff(c), n * cs)
+        for i in range(n):
+            if data[i * cs + 4:i * cs + 8] != b"ftyp" or c + i < next_ok or c + i in skip_firsts:
+                continue
+            cc = c + i
+            if vol.bitmap is not None and vol.in_use(cc):
+                continue  # belongs to a live file
+            res = carve_at(vol, cc, heap_end)
+            if not res:
+                partial += 1
+                continue
+            size, moov_at = res
+            next_ok = cc + -(-size // cs)
+            when, dur = parse_mvhd(vol, moov_at)
+            ext = "mov" if data[i * cs + 8:i * cs + 12] == b"qt  " else "mp4"
+            stamp = when.strftime("%Y%m%d_%H%M%S_") if when else ""
+            out.append({
+                "name": "%sc%d.%s" % (stamp, cc, ext), "isdir": False, "deleted": True,
+                "first": cc, "size": size, "nofat": True, "mtime": when,
+                "path": "(carved)/", "info": "%.0fs" % dur if dur else "",
+            })
+        c += n
+        sys.stderr.write("\rcarving %3d%%" % min(100, (c - 2) * 100 // vol.ccount))
+    sys.stderr.write("\n")
+    if partial:
+        print("(%d video starts had no readable moov section and were skipped: "
+              "overwritten or fragmented)" % partial, file=sys.stderr)
+
+
 def assess(vol, ent):
     """Fill ent['clusters'] and ent['status'] (how many clusters were reused)."""
     cl = vol.clusters_of(ent["first"], ent["size"], ent["nofat"])
@@ -304,6 +393,9 @@ def main():
     ap.add_argument("--out", help="recover into this folder (omit to only list)")
     ap.add_argument("--deep", action="store_true",
                     help="also scan the whole card (slow; finds files from deleted folders)")
+    ap.add_argument("--carve", action="store_true",
+                    help="also find MP4/MOV videos in free space by signature "
+                         "(works after a reformat or when directory entries are gone)")
     ap.add_argument("--any", action="store_true", help="all file types, not just video")
     ap.add_argument("--ext", help="comma-separated extensions to match (overrides default)")
     ap.add_argument("--match", help="only names containing this text")
@@ -320,6 +412,9 @@ def main():
     walk(vol, vol.root, None, False, "/", set(), False, found)
     if a.deep:
         deep_scan(vol, found)
+
+    if a.carve:
+        carve(vol, {e["first"] for e in found}, found)
 
     exts = {e.strip().lower().lstrip(".") for e in a.ext.split(",")} if a.ext else VIDEO_EXTS
     uniq = {}
@@ -343,8 +438,8 @@ def main():
         return
     for i, e in enumerate(files, 1):
         when = e["mtime"].strftime("%Y-%m-%d %H:%M") if e["mtime"] else "?"
-        print("%3d  %8.1f MB  %s  %-22s  %s%s" %
-              (i, e["size"] / 1e6, when, e["status"], e["path"], e["name"]))
+        print("%3d  %8.1f MB  %s  %-22s  %s%s  %s" %
+              (i, e["size"] / 1e6, when, e["status"], e["path"], e["name"], e.get("info", "")))
 
     if a.out:
         os.makedirs(a.out, exist_ok=True)
