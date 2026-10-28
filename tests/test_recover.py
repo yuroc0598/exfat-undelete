@@ -43,7 +43,24 @@ class RecoverTest(unittest.TestCase):
             with open(os.path.join(out, "20250101_000000_c60.mp4"), "rb") as f:
                 self.assertEqual(f.read(), m.orphan_video())
             # live file and already-listed deleted files must not be carved a second time
-            self.assertEqual(res.stdout.count("(carved)"), 1)
+            self.assertEqual(res.stdout.count("(carved)"), 2)  # contiguous + fragmented orphan
+
+    def test_fragmented(self):
+        sys.path.insert(0, HERE)
+        import make_test_image as m
+        with tempfile.TemporaryDirectory() as tmp:
+            img, out = os.path.join(tmp, "card.img"), os.path.join(tmp, "out")
+            m.main(img)
+            res = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "exfat_undelete.py"),
+                                  img, "--carve", "--out", out],
+                                 check=True, capture_output=True, text=True)
+            # deleted file whose FAT chain was wiped: rebuilt around the live cluster
+            with open(os.path.join(out, "frag.mp4"), "rb") as f:
+                self.assertEqual(f.read(), m.data(7, m.FRAG_FILE_SIZE))
+            # carved video split around live data: structure walks across the gap
+            with open(os.path.join(out, "20250101_000000_c70.mp4"), "rb") as f:
+                self.assertEqual(f.read(), m.FRAG_VIDEO())
+            self.assertIn("2 fragments (estimated)", res.stdout)
 
 
 if __name__ == "__main__":

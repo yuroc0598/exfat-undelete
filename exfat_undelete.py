@@ -14,6 +14,8 @@ been reused since.
 import argparse
 import datetime
 import os
+from array import array
+from bisect import bisect_left
 import platform
 import re
 import struct
@@ -87,6 +89,7 @@ class Vol:
         self.bps = 1 << b[0x6C]
         self.csize = self.bps << b[0x6D]
         self.bitmap = None
+        self._free = None
         self._fat_cache = {}
 
     def coff(self, c):
@@ -111,23 +114,56 @@ class Vol:
             c = self.fat(c)
         return out
 
-    def clusters_of(self, first, size, nofat):
-        """Cluster list for an object; size None means follow the FAT to the end."""
-        if not self.valid(first):
+    def free_list(self):
+        """Sorted numbers of all clusters the allocation bitmap currently marks free."""
+        if self._free is None:
+            free = array("I")
+            for i, byte in enumerate(self.bitmap):
+                if byte == 0xFF:
+                    continue
+                for b in range(8):
+                    c = i * 8 + b
+                    if not byte >> b & 1 and c < self.ccount:
+                        free.append(c + 2)
+            self._free = free
+        return self._free
+
+    def free_run(self, start, count):
+        """The next `count` free clusters from `start`, skipping allocated ones."""
+        free = self.free_list()
+        i = bisect_left(free, start)
+        if i >= len(free) or free[i] != start or i + count > len(free):
             return []
+        return list(free[i:i + count])
+
+    def locate(self, first, size, nofat, deleted=False):
+        """(cluster list, how it was found). size None means follow the FAT to the end."""
+        if not self.valid(first):
+            return [], "bad"
         if size is None:
-            return self.chain(first, 1 << 22)
+            return self.chain(first, 1 << 22), "fat"
         need = -(-size // self.csize)
         if need == 0:
-            return []
+            return [], "bad"
         if not nofat:
             ch = self.chain(first, need)
             if len(ch) == need:
-                return ch
-        # NoFatChain flag, or FAT entries were wiped on delete: assume contiguous.
+                return ch, "fat"
         if first + need - 1 >= self.ccount + 2:
-            return []
-        return list(range(first, first + need))
+            return [], "bad"
+        run = list(range(first, first + need))
+        # NoFatChain means contiguous by definition. Otherwise the file may have been
+        # fragmented and its FAT chain wiped on delete: if live data now sits inside
+        # the contiguous run, assume the file was written around it (free clusters only).
+        if deleted and not nofat and self.bitmap is not None \
+                and any(self.in_use(c) for c in run):
+            gap = self.free_run(first, need)
+            if gap:
+                return gap, "gap-skip"
+        return run, "contiguous"
+
+    def clusters_of(self, first, size, nofat):
+        return self.locate(first, size, nofat)[0]
 
     def read_clusters(self, clusters):
         return b"".join(self.dev.read(self.coff(c), self.csize) for c in clusters)
@@ -252,17 +288,43 @@ CARVE_ATOMS = {b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"junk", b"
                b"pnot", b"meta", b"udta", b"moof", b"mfra", b"sidx", b"styp", b"pdin"}
 
 
-def read_atom(vol, off):
-    h = vol.dev.read(off, 16)
+class Stream:
+    """A file laid out over the free clusters from `start` on, skipping allocated ones.
+
+    This is how a fragmented file looks when it was written around files that still exist.
+    """
+
+    def __init__(self, vol, start):
+        self.vol, self.free = vol, vol.free_list()
+        self.idx = bisect_left(self.free, start)
+        self.length = (len(self.free) - self.idx) * vol.csize
+
+    def read(self, off, n):
+        cs, out = self.vol.csize, []
+        while n > 0 and off < self.length:
+            i, r = divmod(off, cs)
+            take = min(n, cs - r)
+            out.append(self.vol.dev.read(self.vol.coff(self.free[self.idx + i]) + r, take))
+            off, n = off + take, n - take
+        return b"".join(out)
+
+    def clusters(self, size):
+        return list(self.free[self.idx:self.idx + -(-size // self.vol.csize)])
+
+
+def read_atom(st, off):
+    h = st.read(off, 16)
+    if len(h) < 16:
+        return 0, b""
     size, typ = struct.unpack(">I4s", h[:8])
     if size == 1:
         size = struct.unpack(">Q", h[8:16])[0]
     return size, typ
 
 
-def parse_mvhd(vol, moov_off):
+def parse_mvhd(st, moov_off):
     """(creation datetime, duration seconds) from the first child of moov, if it is mvhd."""
-    d = vol.dev.read(moov_off + 8, 40)
+    d = st.read(moov_off + 8, 40)
     if d[4:8] != b"mvhd":
         return None, None
     if d[8] == 1:
@@ -278,13 +340,13 @@ def parse_mvhd(vol, moov_off):
     return when, (dur / ts if ts else None)
 
 
-def carve_at(vol, c, heap_end):
-    """Walk MP4/MOV top-level atoms from cluster c; return the file's extent if it is complete."""
-    start = pos = vol.coff(c)
+def carve_at(st):
+    """Walk MP4/MOV top-level atoms of a stream; return (size, moov offset) if complete."""
+    pos = 0
     seen, moov_at = [], None
-    while pos + 8 <= heap_end:
-        size, typ = read_atom(vol, pos)
-        if typ not in CARVE_ATOMS or size < 8 or pos + size > heap_end:
+    while pos + 8 <= st.length:
+        size, typ = read_atom(st, pos)
+        if typ not in CARVE_ATOMS or size < 8 or pos + size > st.length:
             break
         if typ == b"ftyp" and b"ftyp" in seen:
             break  # next file starts here
@@ -296,13 +358,12 @@ def carve_at(vol, c, heap_end):
             break
     if not seen or seen[0] != b"ftyp" or moov_at is None or b"mdat" not in seen:
         return None
-    return pos - start, moov_at
+    return pos, moov_at
 
 
 def carve(vol, skip_firsts, out):
     """Find MP4/MOV files in free space by signature, with no directory entry needed."""
     cs, last = vol.csize, vol.ccount + 2
-    heap_end = vol.coff(last)
     step = max(1, (8 << 20) // cs)
     next_ok, c, partial = 2, 2, 0
     while c < last:
@@ -312,41 +373,52 @@ def carve(vol, skip_firsts, out):
             if data[i * cs + 4:i * cs + 8] != b"ftyp" or c + i < next_ok or c + i in skip_firsts:
                 continue
             cc = c + i
-            if vol.bitmap is not None and vol.in_use(cc):
+            if vol.in_use(cc):
                 continue  # belongs to a live file
-            res = carve_at(vol, cc, heap_end)
+            st = Stream(vol, cc)
+            res = carve_at(st)
             if not res:
                 partial += 1
                 continue
             size, moov_at = res
-            next_ok = cc + -(-size // cs)
-            when, dur = parse_mvhd(vol, moov_at)
+            clusters = st.clusters(size)
+            next_ok = clusters[-1] + 1
+            when, dur = parse_mvhd(st, moov_at)
             ext = "mov" if data[i * cs + 8:i * cs + 12] == b"qt  " else "mp4"
             stamp = when.strftime("%Y%m%d_%H%M%S_") if when else ""
             out.append({
                 "name": "%sc%d.%s" % (stamp, cc, ext), "isdir": False, "deleted": True,
                 "first": cc, "size": size, "nofat": True, "mtime": when,
                 "path": "(carved)/", "info": "%.0fs" % dur if dur else "",
+                "clusters": clusters, "method": "carved",
             })
         c += n
         sys.stderr.write("\rcarving %3d%%" % min(100, (c - 2) * 100 // vol.ccount))
     sys.stderr.write("\n")
     if partial:
         print("(%d video starts had no readable moov section and were skipped: "
-              "overwritten or fragmented)" % partial, file=sys.stderr)
+              "overwritten, or fragmented around other deleted data)" % partial, file=sys.stderr)
 
 
 def assess(vol, ent):
-    """Fill ent['clusters'] and ent['status'] (how many clusters were reused)."""
-    cl = vol.clusters_of(ent["first"], ent["size"], ent["nofat"])
-    ent["clusters"] = cl
+    """Fill ent['clusters'] and ent['status'] (reuse and fragmentation)."""
+    if ent.get("clusters") is None:
+        ent["clusters"], ent["method"] = vol.locate(ent["first"], ent["size"], ent["nofat"], True)
+    cl = ent["clusters"]
     if not cl:
         ent["status"] = "bad pointer"
     elif vol.bitmap is None:
         ent["status"] = "unknown"
     else:
         used = sum(vol.in_use(c) for c in cl)
-        ent["status"] = "intact" if used == 0 else "%d/%d clusters reused" % (used, len(cl))
+        frags = len(runs(cl))
+        if used:
+            ent["status"] = "%d/%d clusters reused" % (used, len(cl))
+        elif frags > 1:
+            exact = ent["method"] == "fat"
+            ent["status"] = "%d fragments%s" % (frags, "" if exact else " (estimated)")
+        else:
+            ent["status"] = "intact"
 
 
 def runs(clusters):
@@ -414,6 +486,8 @@ def main():
         deep_scan(vol, found)
 
     if a.carve:
+        if vol.bitmap is None:
+            sys.exit("--carve needs the allocation bitmap, which could not be read.")
         carve(vol, {e["first"] for e in found}, found)
 
     exts = {e.strip().lower().lstrip(".") for e in a.ext.split(",")} if a.ext else VIDEO_EXTS
@@ -438,7 +512,7 @@ def main():
         return
     for i, e in enumerate(files, 1):
         when = e["mtime"].strftime("%Y-%m-%d %H:%M") if e["mtime"] else "?"
-        print("%3d  %8.1f MB  %s  %-22s  %s%s  %s" %
+        print("%3d  %8.1f MB  %s  %-26s  %s%s  %s" %
               (i, e["size"] / 1e6, when, e["status"], e["path"], e["name"], e.get("info", "")))
 
     if a.out:

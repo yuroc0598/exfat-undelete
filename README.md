@@ -35,7 +35,7 @@ Status column: `intact` means none of the file's clusters were reused; `N/M clus
 
 - Reformatted cards, or files deleted long ago whose directory entries were reused: use `--carve`. It needs the file's first cluster and its `moov` section to be intact, and assumes the file was written contiguously. Only MP4/MOV (including `.m4v`/`.3gp`-style ISO files) are carved; other formats are only found through directory entries.
 - Anything the card has overwritten since is gone for good, whatever the tool.
-- Deleted files are assumed to be stored contiguously (cameras almost always do this). A fragmented file whose FAT chain was cleared on delete may come out corrupted.
+- Fragmentation: files with the exFAT `NoFatChain` flag are contiguous by definition. For other deleted files the FAT chain is used if it survived. If it was wiped, or when carving, the file is rebuilt by taking the free clusters from its start and skipping clusters that now belong to live files (the usual way a file gets fragmented). Such results are marked `N fragments (estimated)`. This fails when the gap holds other *deleted* data rather than live files, and it can't reorder fragments written out of sequence. Check estimated files by playing them.
 - Partition tables: whole-volume, MBR and GPT with 512-byte sectors.
 - Developed and tested on macOS only against synthetic images (`tests/`). Not yet validated across many real cards. Reports welcome.
 

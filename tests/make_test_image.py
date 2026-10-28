@@ -18,13 +18,20 @@ ORPHAN_CREATED = 3818534400  # 2025-01-01 00:00:00 UTC in seconds since 1904
 ORPHAN_SECONDS = 12
 
 
-def orphan_video():
+def orphan_video(mdat_size=ORPHAN_MDAT, seed=9):
     ftyp = struct.pack(">I4s4sI4s4s", 24, b"ftyp", b"isom", 0, b"isom", b"mp41")
-    mdat = struct.pack(">I4s", ORPHAN_MDAT, b"mdat") + data(9, ORPHAN_MDAT - 8)
+    mdat = struct.pack(">I4s", mdat_size, b"mdat") + data(seed, mdat_size - 8)
     mvhd = struct.pack(">I4sB3xIIII", 108, b"mvhd", 0, ORPHAN_CREATED, ORPHAN_CREATED,
                        1000, ORPHAN_SECONDS * 1000).ljust(108, b"\0")
     moov = struct.pack(">I4s", 116, b"moov") + mvhd
     return ftyp + mdat + moov
+
+
+FRAG_FILE_SIZE = 9000
+
+
+def FRAG_VIDEO():
+    return orphan_video(9000, 11)
 
 
 def checksum(buf):
@@ -84,6 +91,17 @@ def main(out):
 
     put(60, orphan_video())  # no directory entry anywhere: only carving can find it
 
+    def put_frag(clusters, blob):
+        for i, c in enumerate(clusters):
+            put(c, blob[i * CL:(i + 1) * CL])
+
+    # Fragmented orphan video: clusters 70, 72, 73; live data occupies 71 in between.
+    put_frag([70, 72, 73], FRAG_VIDEO())
+    put(71, data(20, CL))
+    # Deleted fragmented file with a wiped FAT chain: clusters 80, 82, 83; live data on 81.
+    put_frag([80, 82, 83], data(7, FRAG_FILE_SIZE))
+    put(81, data(21, CL))
+
     # FAT: bitmap, root, DCIM chains end-of-file; live.mp4 uses NoFatChain.
     def fat(c, v):
         struct.pack_into("<I", vol, FAT_OFF * SECT + 4 * c, v)
@@ -91,7 +109,7 @@ def main(out):
         fat(c, 0xFFFFFFFF)
 
     bm = bytearray((NCL + 7) // 8)
-    for c in (BITMAP_C, ROOT_C, DCIM_C, 41, 50):  # in use now; 41 = overwritten by "someone"
+    for c in (BITMAP_C, ROOT_C, DCIM_C, 41, 50, 71, 81):  # in use now; 41 = overwritten
         bm[(c - 2) >> 3] |= 1 << ((c - 2) & 7)
     put(BITMAP_C, bm)
 
@@ -106,7 +124,8 @@ def main(out):
     root += file_set("live.mp4", 50, 4096)
     put(ROOT_C, root)
     put(DCIM_C, file_set("video2.MOV", 20, 9000, deleted=True)
-        + file_set("reused.mp4", 40, 8192, deleted=True))
+        + file_set("reused.mp4", 40, 8192, deleted=True)
+        + file_set("frag.mp4", 80, FRAG_FILE_SIZE, deleted=True, nofat=False))
     put(OLD_C, file_set("lost.mp4", 30, 5000))  # lives in a deleted folder
 
     mbr = bytearray(512)
