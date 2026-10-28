@@ -105,6 +105,9 @@ class Vol:
         self.bitmap = None
         self._free = None
         self._fat_cache = {}
+        self.system = set()      # clusters of the bitmap, upcase table and root directory
+        self.live_refs = None    # clusters that an existing directory entry points at
+        self.live_names = {}     # first cluster -> path of an existing file
 
     def coff(self, c):
         return self.base + self.heap_off * self.bps + (c - 2) * self.csize
@@ -183,17 +186,26 @@ class Vol:
         return b"".join(self.dev.read(self.coff(c), self.csize) for c in clusters)
 
     def load_bitmap(self):
-        raw = self.read_clusters(self.clusters_of(self.root, None, False))
+        root = self.clusters_of(self.root, None, False)
+        self.system.update(root)
+        raw = self.read_clusters(root)
         for i in range(len(raw) // 32):
             e = raw[i * 32:i * 32 + 32]
             if e[0] == 0:
                 break
-            if e[0] == 0x81:
+            if e[0] in (0x81, 0x82):  # allocation bitmap, upcase table
                 first = struct.unpack_from("<I", e, 20)[0]
                 length = struct.unpack_from("<Q", e, 24)[0]
                 cl = self.clusters_of(first, length, False)
-                self.bitmap = self.read_clusters(cl)[:length]
-                return
+                self.system.update(cl)
+                if e[0] == 0x81:
+                    self.bitmap = self.read_clusters(cl)[:length]
+
+    def is_live(self, c):
+        """True if cluster c belongs to a file that exists now (not merely marked allocated)."""
+        if self.live_refs is not None:
+            return c in self.live_refs
+        return self.bitmap is not None and self.in_use(c)
 
     def in_use(self, c):
         i = c - 2
@@ -259,7 +271,10 @@ def walk(vol, first, size, nofat, path, seen, deleted_dir, out):
     if first in seen:
         return
     seen.add(first)
-    raw = vol.read_clusters(vol.clusters_of(first, size, nofat))
+    dir_clusters = vol.clusters_of(first, size, nofat)
+    if not deleted_dir:
+        vol.live_refs.update(dir_clusters)
+    raw = vol.read_clusters(dir_clusters)
     for ent in iter_entries(raw):
         if ent is None:
             continue
@@ -270,6 +285,11 @@ def walk(vol, first, size, nofat, path, seen, deleted_dir, out):
                  path + ent["name"] + "/", seen, ent["deleted"], out)
         elif ent["deleted"]:
             out.append(ent)
+        else:
+            cl = vol.clusters_of(ent["first"], ent["size"], ent["nofat"])
+            vol.live_refs.update(cl)
+            if cl:
+                vol.live_names[cl[0]] = path + ent["name"]
 
 
 def deep_scan(vol, out):
@@ -394,11 +414,8 @@ def in_heap(vol, off):
     return vol is not None and vol.coff(2) <= off < vol.coff(vol.ccount + 2)
 
 
-def start_in_use(vol, off):
-    """True if the cluster holding byte `off` belongs to a file that exists now."""
-    if vol is None or vol.bitmap is None or not in_heap(vol, off):
-        return False
-    return vol.in_use((off - vol.coff(2)) // vol.csize + 2)
+def cluster_at(vol, off):
+    return (off - vol.coff(2)) // vol.csize + 2 if in_heap(vol, off) else None
 
 
 def overlap_pct(vol, start, size):
@@ -410,7 +427,7 @@ def overlap_pct(vol, start, size):
         return 0
     c0 = (lo - vol.coff(2)) // vol.csize + 2
     c1 = (hi - 1 - vol.coff(2)) // vol.csize + 2
-    return 100 * sum(vol.in_use(c) for c in range(c0, c1 + 1)) // (c1 - c0 + 1)
+    return 100 * sum(vol.is_live(c) for c in range(c0, c1 + 1)) // (c1 - c0 + 1)
 
 
 def ts_sync_run(buf):
@@ -468,19 +485,25 @@ def carve(vol, dev, skip_clusters, out):
     """
     total, step, claimed = dev.size(), 8 << 20, 0
     kinds = ("mp4", "avi", "mts")
-    stats = {k: {"seen": 0, "ok": 0, "live": 0, "bad": 0} for k in kinds}
+    names = {"mp4": "MP4/MOV", "avi": "AVI", "mts": "MTS/M2TS"}
+    stats = {k: {"seen": 0, "ok": 0, "live": 0, "bad": 0, "orphan": 0} for k in kinds}
+    live_files = []
     for pos in range(0, total, step):
         data = dev.read(pos, min(step + 8192, total - pos))
         for s, kind in candidates(data, pos, step):
             start, st = pos + s, stats[kind]
             if start < claimed:
                 continue
-            if start_in_use(vol, start):
+            c = cluster_at(vol, start)
+            if c is not None and vol.is_live(c):
                 st["live"] += 1
+                live_files.append("%s  %s" % (names[kind], vol.live_names.get(
+                    c, "(inside an existing file)")))
                 continue
-            if in_heap(vol, start) and (start - vol.coff(2)) % vol.csize == 0 \
-                    and (start - vol.coff(2)) // vol.csize + 2 in skip_clusters:
+            if c is not None and (start - vol.coff(2)) % vol.csize == 0 and c in skip_clusters:
                 continue  # already listed from its directory entry
+            if c is not None and vol.bitmap is not None and vol.in_use(c):
+                st["orphan"] += 1  # marked allocated, yet no existing file points here
             st["seen"] += 1
             when = dur = clusters = extents = None
             if kind == "mp4":
@@ -523,13 +546,19 @@ def carve(vol, dev, skip_clusters, out):
             })
         sys.stderr.write("\rscanning %3d%%" % min(100, (pos + step) * 100 // total))
     sys.stderr.write("\n")
-    names = {"mp4": "MP4/MOV", "avi": "AVI", "mts": "MTS/M2TS"}
     print("Signature scan of %.1f GB:" % (total / 1e9), file=sys.stderr)
     for k in kinds:
         s = stats[k]
         print("  %-9s %4d candidates: %d recovered, %d unusable (no complete structure: "
-              "overwritten or fragmented), %d inside live files (ignored)" %
+              "overwritten or fragmented), %d are existing files (ignored)" %
               (names[k], s["seen"] + s["live"], s["ok"], s["bad"], s["live"]), file=sys.stderr)
+        if s["orphan"]:
+            print("            (%d of them sit on clusters marked allocated that no file "
+                  "points to: treated as deleted)" % s["orphan"], file=sys.stderr)
+    if live_files:
+        print("Existing (not deleted) videos that were ignored:", file=sys.stderr)
+        for f in live_files:
+            print("   ", f, file=sys.stderr)
 
 
 def assess(vol, ent):
@@ -649,6 +678,7 @@ def main():
         print("exFAT: cluster %d KB, %d clusters" % (vol.csize // 1024, vol.ccount),
               file=sys.stderr)
         vol.load_bitmap()
+        vol.live_refs = set(vol.system)
         walk(vol, vol.root, None, False, "/", set(), False, found)
         if a.deep:
             deep_scan(vol, found)

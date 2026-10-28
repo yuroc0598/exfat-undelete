@@ -50,7 +50,12 @@ class RecoverTest(unittest.TestCase):
             # contiguous orphan, and one split around live data (rebuilt across the gap)
             self.assertIn(m.orphan_video(), carved)
             self.assertIn(m.FRAG_VIDEO(), carved)
-            self.assertEqual(len(carved), 2)  # live and already-listed files not carved again
+            # allocated-but-unreferenced clusters are treated as deleted ...
+            self.assertIn(m.ALLOC_ORPHAN(), carved)
+            # ... but an existing file is left alone, and named in the report
+            self.assertNotIn(m.LIVE_VIDEO(), carved)
+            self.assertIn("/livevideo.mp4", res.stderr)
+            self.assertEqual(len(carved), 3)  # nothing carved twice
             self.assertIn("12s", res.stdout)
             self.assertEqual(got["frag.mp4"], m.data(7, m.FRAG_FILE_SIZE))
             self.assertIn("2 fragments (estimated)", res.stdout)

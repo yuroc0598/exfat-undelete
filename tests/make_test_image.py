@@ -30,6 +30,14 @@ def orphan_video(mdat_size=ORPHAN_MDAT, seed=9):
 FRAG_FILE_SIZE = 9000
 
 
+def ALLOC_ORPHAN():
+    return orphan_video(7000, 13)
+
+
+def LIVE_VIDEO():
+    return orphan_video(6500, 14)
+
+
 def FRAG_VIDEO():
     return orphan_video(9000, 11)
 
@@ -98,6 +106,10 @@ def main(out):
     # Fragmented orphan video: clusters 70, 72, 73; live data occupies 71 in between.
     put_frag([70, 72, 73], FRAG_VIDEO())
     put(71, data(20, CL))
+    # Allocated-but-unreferenced video (bitmap says in use, no directory entry points at it):
+    put(90, ALLOC_ORPHAN())
+    # A real, existing video that must be left alone.
+    put(100, LIVE_VIDEO())
     # Deleted fragmented file with a wiped FAT chain: clusters 80, 82, 83; live data on 81.
     put_frag([80, 82, 83], data(7, FRAG_FILE_SIZE))
     put(81, data(21, CL))
@@ -109,7 +121,7 @@ def main(out):
         fat(c, 0xFFFFFFFF)
 
     bm = bytearray((NCL + 7) // 8)
-    for c in (BITMAP_C, ROOT_C, DCIM_C, 41, 50, 71, 81):  # in use now; 41 = overwritten
+    for c in (BITMAP_C, ROOT_C, DCIM_C, 41, 50, 71, 81, 90, 91, 100, 101):  # in use now
         bm[(c - 2) >> 3] |= 1 << ((c - 2) & 7)
     put(BITMAP_C, bm)
 
@@ -122,6 +134,7 @@ def main(out):
     root += file_set("OLD", OLD_C, CL, isdir=True, deleted=True)
     root += file_set("video1.mp4", 10, 10000, deleted=True)
     root += file_set("live.mp4", 50, 4096)
+    root += file_set("livevideo.mp4", 100, len(LIVE_VIDEO()))
     put(ROOT_C, root)
     put(DCIM_C, file_set("video2.MOV", 20, 9000, deleted=True)
         + file_set("reused.mp4", 40, 8192, deleted=True)
