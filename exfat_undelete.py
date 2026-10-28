@@ -17,6 +17,7 @@ import os
 from array import array
 from bisect import bisect_left
 import platform
+import pwd
 import re
 import struct
 import sys
@@ -431,6 +432,31 @@ def runs(clusters):
     return r
 
 
+def real_home():
+    """Home of the user who ran sudo, not root's."""
+    if os.environ.get("SUDO_USER"):
+        return pwd.getpwnam(os.environ["SUDO_USER"]).pw_dir
+    return os.path.expanduser("~")
+
+
+def give_to_user(path):
+    """Under sudo, files would be owned by root; hand them to the invoking user."""
+    if os.geteuid() == 0 and os.environ.get("SUDO_UID"):
+        os.chown(path, int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"]))
+
+
+def pick(files, spec):
+    """'all' or '1,3,5-7' -> list of entries."""
+    if spec.lower() == "all":
+        return list(files)
+    want = set()
+    for part in spec.replace(" ", "").split(","):
+        lo, _, hi = part.partition("-")
+        if lo.isdigit() and (not hi or hi.isdigit()):
+            want.update(range(int(lo), int(hi or lo) + 1))
+    return [e for i, e in enumerate(files, 1) if i in want]
+
+
 def restore(vol, ent, outdir):
     name = re.sub(r"[\x00-\x1f/\\:]", "_", ent["name"]) or "unnamed_%d" % ent["first"]
     dest, n = os.path.join(outdir, name), 1
@@ -455,6 +481,7 @@ def restore(vol, ent, outdir):
     if ent["mtime"]:
         t = ent["mtime"].timestamp()
         os.utime(dest, (t, t))
+    give_to_user(dest)
     return dest
 
 
@@ -515,14 +542,25 @@ def main():
         print("%3d  %8.1f MB  %s  %-26s  %s%s  %s" %
               (i, e["size"] / 1e6, when, e["status"], e["path"], e["name"], e.get("info", "")))
 
-    if a.out:
-        os.makedirs(a.out, exist_ok=True)
-        for e in files:
-            if e["clusters"]:
-                restore(vol, e, a.out)
-        print("Done. Files written to", a.out)
-    else:
-        print("\nListing only. Add --out FOLDER (on your Mac, not the card) to recover.")
+    out_dir, chosen = a.out, files
+    if not out_dir:
+        if not sys.stdin.isatty():
+            print("\nListing only. Add --out FOLDER (on your Mac, not the card) to recover.")
+            return
+        ans = input("\nRecover which? Numbers like 1,3,5-7, 'all', or Enter to quit: ").strip()
+        if not ans:
+            return
+        chosen = pick(files, ans)
+        if not chosen:
+            sys.exit("Nothing matched that selection.")
+        default = os.path.join(real_home(), "recovered")
+        out_dir = os.path.expanduser(input("Save to folder [%s]: " % default).strip() or default)
+    os.makedirs(out_dir, exist_ok=True)
+    give_to_user(out_dir)
+    for e in chosen:
+        if e["clusters"]:
+            print("recovered:", restore(vol, e, out_dir))
+    print("Done. %d file(s) in %s" % (len(chosen), out_dir))
 
 
 if __name__ == "__main__":

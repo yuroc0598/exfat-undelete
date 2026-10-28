@@ -13,9 +13,11 @@ diskutil unmountDisk /dev/disk4     # unmount (don't eject)
 # optional but safer: work from an image
 sudo dd if=/dev/rdisk4 of=card.img bs=4m
 
-sudo python3 exfat_undelete.py /dev/disk4                    # list only
-sudo python3 exfat_undelete.py /dev/disk4 --out ~/recovered  # recover
+sudo python3 exfat_undelete.py /dev/disk4                    # scan, then asks what to recover
+sudo python3 exfat_undelete.py /dev/disk4 --out ~/recovered  # recover everything found, no prompt
 ```
+
+After the scan it prints a numbered list and asks which files to recover (`1,3,5-7` or `all`) and where to save them. The folder defaults to `~/recovered`, and files are given to your user, not root. If the output isn't a terminal and `--out` isn't set, it only lists.
 
 Always recover to a different disk than the card. Stop using the card as soon as you notice the deletion.
 
