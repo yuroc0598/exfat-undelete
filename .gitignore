@@ -1,0 +1,4 @@
+out/
+test/
+*.img
+__pycache__/
