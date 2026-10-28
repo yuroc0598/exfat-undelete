@@ -38,6 +38,19 @@ class Dev:
         self.path = path
         self.fd = os.open(path, os.O_RDONLY)
 
+    def size(self):
+        try:
+            n = os.lseek(self.fd, 0, os.SEEK_END)
+            if n:
+                return n
+        except OSError:
+            pass
+        import fcntl  # raw macOS devices report no size via lseek
+        bs, cnt = bytearray(4), bytearray(8)
+        fcntl.ioctl(self.fd, 0x40046418, bs)   # DKIOCGETBLOCKSIZE
+        fcntl.ioctl(self.fd, 0x40086419, cnt)  # DKIOCGETBLOCKCOUNT
+        return struct.unpack("<I", bs)[0] * struct.unpack("<Q", cnt)[0]
+
     def read(self, off, n):
         start = off - off % ALIGN
         end = -(-(off + n) // ALIGN) * ALIGN
@@ -78,7 +91,7 @@ def find_volume(dev, offset):
             start = struct.unpack_from("<Q", table, i * size + 32)[0]
             if start and is_exfat(start * 512):
                 return start * 512
-    sys.exit("No exFAT volume found. Check the device, or pass --offset BYTES.")
+    return None
 
 
 class Vol:
@@ -362,47 +375,172 @@ def carve_at(st):
     return pos, moov_at
 
 
-def carve(vol, skip_firsts, out):
-    """Find MP4/MOV files in free space by signature, with no directory entry needed."""
-    cs, last = vol.csize, vol.ccount + 2
-    step = max(1, (8 << 20) // cs)
-    next_ok, c, partial = 2, 2, 0
-    while c < last:
-        n = min(step, last - c)
-        data = vol.dev.read(vol.coff(c), n * cs)
-        for i in range(n):
-            if data[i * cs + 4:i * cs + 8] != b"ftyp" or c + i < next_ok or c + i in skip_firsts:
+class RawStream:
+    """A file assumed contiguous from absolute byte offset `start`."""
+
+    def __init__(self, dev, start, limit):
+        self.dev, self.start, self.length = dev, start, limit - start
+
+    def read(self, off, n):
+        n = min(n, self.length - off)
+        return self.dev.read(self.start + off, n) if n > 0 else b""
+
+
+SECTOR = 512
+TS_PACKET = 192  # M2TS: 4-byte timecode + 188-byte transport packet (AVCHD .MTS)
+
+
+def in_heap(vol, off):
+    return vol is not None and vol.coff(2) <= off < vol.coff(vol.ccount + 2)
+
+
+def start_in_use(vol, off):
+    """True if the cluster holding byte `off` belongs to a file that exists now."""
+    if vol is None or vol.bitmap is None or not in_heap(vol, off):
+        return False
+    return vol.in_use((off - vol.coff(2)) // vol.csize + 2)
+
+
+def overlap_pct(vol, start, size):
+    """Percent of the byte range that the allocation bitmap currently marks in use."""
+    if vol is None or vol.bitmap is None:
+        return 0
+    lo, hi = max(start, vol.coff(2)), min(start + size, vol.coff(vol.ccount + 2))
+    if hi <= lo:
+        return 0
+    c0 = (lo - vol.coff(2)) // vol.csize + 2
+    c1 = (hi - 1 - vol.coff(2)) // vol.csize + 2
+    return 100 * sum(vol.in_use(c) for c in range(c0, c1 + 1)) // (c1 - c0 + 1)
+
+
+def ts_sync_run(buf):
+    """Number of leading 192-byte packets whose sync byte (0x47) is where it should be."""
+    s = buf[4::TS_PACKET]
+    return len(s) - len(s.lstrip(b"G"))
+
+
+def ts_extent(dev, start, limit):
+    block, pkts, off = TS_PACKET * 21845, 0, start
+    while off < limit:
+        buf = dev.read(off, min(block, limit - off))
+        buf = buf[:len(buf) // TS_PACKET * TS_PACKET]
+        if not buf:
+            break
+        good = ts_sync_run(buf)
+        pkts += good
+        if good < len(buf) // TS_PACKET:
+            break
+        off += len(buf)
+    return pkts * TS_PACKET
+
+
+def candidates(data, pos, step):
+    """(offset in chunk, kind) for every sector-aligned video signature in the chunk."""
+    found = []
+    j = data.find(b"ftyp", 4)
+    while j != -1:
+        s = j - 4
+        if s < step and (pos + s) % SECTOR == 0 \
+                and 12 <= struct.unpack_from(">I", data, s)[0] <= 256 \
+                and all(32 <= b < 127 for b in data[j + 4:j + 8]):
+            found.append((s, "mp4"))
+        j = data.find(b"ftyp", j + 1)
+    j = data.find(b"RIFF")
+    while j != -1:
+        if j < step and (pos + j) % SECTOR == 0 and data[j + 8:j + 16] == b"AVI LIST":
+            found.append((j, "avi"))
+        j = data.find(b"RIFF", j + 1)
+    syncs = data[4:step:SECTOR]
+    k = syncs.find(b"G")
+    while k != -1:
+        s = k * SECTOR
+        if len(data) - s >= TS_PACKET * 24 and ts_sync_run(data[s:s + TS_PACKET * 24]) == 24:
+            found.append((s, "mts"))
+        k = syncs.find(b"G", k + 1)
+    return sorted(found)
+
+
+def carve(vol, dev, skip_clusters, out):
+    """Signature scan of the whole device at sector boundaries: MP4/MOV, AVI, MTS.
+
+    Needs no filesystem. If the exFAT volume is readable, starts inside live files are
+    skipped, and fragmented MP4/MOV are rebuilt around live clusters.
+    """
+    total, step, claimed = dev.size(), 8 << 20, 0
+    kinds = ("mp4", "avi", "mts")
+    stats = {k: {"seen": 0, "ok": 0, "live": 0, "bad": 0} for k in kinds}
+    for pos in range(0, total, step):
+        data = dev.read(pos, min(step + 8192, total - pos))
+        for s, kind in candidates(data, pos, step):
+            start, st = pos + s, stats[kind]
+            if start < claimed:
                 continue
-            cc = c + i
-            if vol.in_use(cc):
-                continue  # belongs to a live file
-            st = Stream(vol, cc)
-            res = carve_at(st)
-            if not res:
-                partial += 1
+            if start_in_use(vol, start):
+                st["live"] += 1
                 continue
-            size, moov_at = res
-            clusters = st.clusters(size)
-            next_ok = clusters[-1] + 1
-            when, dur = parse_mvhd(st, moov_at)
-            ext = "mov" if data[i * cs + 8:i * cs + 12] == b"qt  " else "mp4"
+            if in_heap(vol, start) and (start - vol.coff(2)) % vol.csize == 0 \
+                    and (start - vol.coff(2)) // vol.csize + 2 in skip_clusters:
+                continue  # already listed from its directory entry
+            st["seen"] += 1
+            when = dur = clusters = extents = None
+            if kind == "mp4":
+                stream = RawStream(dev, start, total)
+                res = carve_at(stream)
+                if not res and in_heap(vol, start) and vol.bitmap is not None \
+                        and (start - vol.coff(2)) % vol.csize == 0:
+                    stream = Stream(vol, (start - vol.coff(2)) // vol.csize + 2)
+                    res = carve_at(stream)  # fragmented: rebuild around live clusters
+                    clusters = stream.clusters(res[0]) if res else None
+                if not res:
+                    st["bad"] += 1
+                    continue
+                size = res[0]
+                when, dur = parse_mvhd(stream, res[1])
+                ext = "mov" if data[s + 8:s + 12] == b"qt  " else "mp4"
+            elif kind == "avi":
+                size = min(struct.unpack_from("<I", data, s + 4)[0] + 8, total - start)
+                ext = "avi"
+                if size < 1 << 20:
+                    st["bad"] += 1
+                    continue
+            else:
+                size, ext = ts_extent(dev, start, total), "mts"
+                if size < 1 << 20:
+                    st["bad"] += 1
+                    continue
+            if clusters:
+                claimed = vol.coff(clusters[-1]) + vol.csize
+            else:
+                extents = [(start, size)]
+                claimed = start + size
+            st["ok"] += 1
             stamp = when.strftime("%Y%m%d_%H%M%S_") if when else ""
             out.append({
-                "name": "%sc%d.%s" % (stamp, cc, ext), "isdir": False, "deleted": True,
-                "first": cc, "size": size, "nofat": True, "mtime": when,
+                "name": "%so%d.%s" % (stamp, start // SECTOR, ext), "isdir": False,
+                "deleted": True, "first": start, "size": size, "nofat": True, "mtime": when,
                 "path": "(carved)/", "info": "%.0fs" % dur if dur else "",
-                "clusters": clusters, "method": "carved",
+                "clusters": clusters, "extents": extents, "method": "carved",
             })
-        c += n
-        sys.stderr.write("\rcarving %3d%%" % min(100, (c - 2) * 100 // vol.ccount))
+        sys.stderr.write("\rscanning %3d%%" % min(100, (pos + step) * 100 // total))
     sys.stderr.write("\n")
-    if partial:
-        print("(%d video starts had no readable moov section and were skipped: "
-              "overwritten, or fragmented around other deleted data)" % partial, file=sys.stderr)
+    names = {"mp4": "MP4/MOV", "avi": "AVI", "mts": "MTS/M2TS"}
+    print("Signature scan of %.1f GB:" % (total / 1e9), file=sys.stderr)
+    for k in kinds:
+        s = stats[k]
+        print("  %-9s %4d candidates: %d recovered, %d unusable (no complete structure: "
+              "overwritten or fragmented), %d inside live files (ignored)" %
+              (names[k], s["seen"] + s["live"], s["ok"], s["bad"], s["live"]), file=sys.stderr)
 
 
 def assess(vol, ent):
     """Fill ent['clusters'] and ent['status'] (reuse and fragmentation)."""
+    if ent.get("extents"):  # contiguous byte range from the signature scan
+        if vol is None or vol.bitmap is None:
+            ent["status"] = "unchecked"
+        else:
+            pct = overlap_pct(vol, ent["first"], ent["size"])
+            ent["status"] = "intact" if pct == 0 else "%d%% on live data" % pct
+        return
     if ent.get("clusters") is None:
         ent["clusters"], ent["method"] = vol.locate(ent["first"], ent["size"], ent["nofat"], True)
     cl = ent["clusters"]
@@ -457,7 +595,7 @@ def pick(files, spec):
     return [e for i, e in enumerate(files, 1) if i in want]
 
 
-def restore(vol, ent, outdir):
+def restore(dev, vol, ent, outdir):
     name = re.sub(r"[\x00-\x1f/\\:]", "_", ent["name"]) or "unnamed_%d" % ent["first"]
     dest, n = os.path.join(outdir, name), 1
     while os.path.exists(dest):
@@ -465,10 +603,11 @@ def restore(vol, ent, outdir):
         dest, n = os.path.join(outdir, "%s_%d%s" % (stem, n, ext)), n + 1
     left, done = ent["size"], 0
     with open(dest, "wb") as f:
-        for first, count in runs(ent["clusters"]):
-            off, run_bytes = vol.coff(first), count * vol.csize
+        extents = ent.get("extents") or [(vol.coff(c), n * vol.csize)
+                                         for c, n in runs(ent["clusters"])]
+        for off, run_bytes in extents:
             for p in range(0, run_bytes, 4 << 20):
-                chunk = vol.dev.read(off + p, min(4 << 20, run_bytes - p, left))
+                chunk = dev.read(off + p, min(4 << 20, run_bytes - p, left))
                 f.write(chunk)
                 left -= len(chunk)
                 done += len(chunk)
@@ -503,19 +642,24 @@ def main():
     a = ap.parse_args()
 
     dev = Dev(a.device)
-    vol = Vol(dev, find_volume(dev, a.offset))
-    print("exFAT: cluster %d KB, %d clusters" % (vol.csize // 1024, vol.ccount), file=sys.stderr)
-    vol.load_bitmap()
-
+    base = find_volume(dev, a.offset)
+    vol = Vol(dev, base) if base is not None else None
     found = []
-    walk(vol, vol.root, None, False, "/", set(), False, found)
-    if a.deep:
-        deep_scan(vol, found)
+    if vol:
+        print("exFAT: cluster %d KB, %d clusters" % (vol.csize // 1024, vol.ccount),
+              file=sys.stderr)
+        vol.load_bitmap()
+        walk(vol, vol.root, None, False, "/", set(), False, found)
+        if a.deep:
+            deep_scan(vol, found)
+    elif a.carve:
+        print("No exFAT volume found: running the signature scan only.", file=sys.stderr)
+    else:
+        sys.exit("No exFAT volume found. Check the device, pass --offset BYTES, "
+                 "or add --carve to scan for videos without a filesystem.")
 
     if a.carve:
-        if vol.bitmap is None:
-            sys.exit("--carve needs the allocation bitmap, which could not be read.")
-        carve(vol, {e["first"] for e in found}, found)
+        carve(vol, dev, {e["first"] for e in found}, found)
 
     exts = {e.strip().lower().lstrip(".") for e in a.ext.split(",")} if a.ext else VIDEO_EXTS
     uniq = {}
@@ -558,8 +702,8 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     give_to_user(out_dir)
     for e in chosen:
-        if e["clusters"]:
-            print("recovered:", restore(vol, e, out_dir))
+        if e.get("clusters") or e.get("extents"):
+            print("recovered:", restore(dev, vol, e, out_dir))
     print("Done. %d file(s) in %s" % (len(chosen), out_dir))
 
 

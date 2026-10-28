@@ -25,7 +25,7 @@ Always recover to a different disk than the card. Stop using the card as soon as
 | --- | --- |
 | `--out DIR` | recover into DIR (omit to only list) |
 | `--deep` | scan the whole card for deleted entries (slow; finds files from deleted folders) |
-| `--carve` | also find MP4/MOV videos in free space by signature, with no directory entry needed (use after a reformat, or for files deleted long ago). Reads each file's creation date and duration, so you can spot the old ones |
+| `--carve` | signature scan of the whole card at sector boundaries for MP4/MOV, AVI and MTS/M2TS (AVCHD) videos. Needs no filesystem, so it works after a reformat, for files deleted long ago, and on cards that no longer read as exFAT. Reads each MP4/MOV's creation date and duration. Prints a report of candidates found, recovered, unusable and ignored |
 | `--match TEXT` | only names containing TEXT |
 | `--min-size MB` | minimum size |
 | `--any` / `--ext mp4,mov` | all file types / custom extensions |
@@ -35,7 +35,7 @@ Status column: `intact` means none of the file's clusters were reused; `N/M clus
 
 ## Limits
 
-- Reformatted cards, or files deleted long ago whose directory entries were reused: use `--carve`. It needs the file's first cluster and its `moov` section to be intact, and assumes the file was written contiguously. Only MP4/MOV (including `.m4v`/`.3gp`-style ISO files) are carved; other formats are only found through directory entries.
+- `--carve` works from file structure, not directory entries. It finds a video only if its start is intact and its structure parses (MP4/MOV need the `moov` section, AVI needs a sane header size, MTS ends where the packet sync is lost). Videos the camera never finished writing (battery pulled mid-recording) have no `moov` and can't be rebuilt. Other formats (MKV, MXF, RAW video) are only found through directory entries.
 - Anything the card has overwritten since is gone for good, whatever the tool.
 - Fragmentation: files with the exFAT `NoFatChain` flag are contiguous by definition. For other deleted files the FAT chain is used if it survived. If it was wiped, or when carving, the file is rebuilt by taking the free clusters from its start and skipping clusters that now belong to live files (the usual way a file gets fragmented). Such results are marked `N fragments (estimated)`. This fails when the gap holds other *deleted* data rather than live files, and it can't reorder fragments written out of sequence. Check estimated files by playing them.
 - Partition tables: whole-volume, MBR and GPT with 512-byte sectors.
